@@ -5,12 +5,12 @@ import pandas as pd
 import torch
 
 import config
-from data_loader import build_merged_dataset
+from data_loader import build_merged_dataset, universe_tag
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
-from rl_utils import get_obs_for_date, build_port_state, ObsCache
+from rl_utils import build_port_state, ObsCache
 
 
 def main():
@@ -44,18 +44,22 @@ def main():
                          static_categorical=STATIC_CATEGORICAL,
                          static_n_continuous=len(STATIC_CONTINUOUS)).to(device)
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
-                             n_extra_state=config.N_EXTRA_STATE, dropout=config.DROPOUT).to(device)
+                             n_extra_state=6, dropout=config.DROPOUT).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     if 'config' in ckpt:
         saved_cfg = ckpt['config']
+        saved_univ = saved_cfg.get('UNIVERSE')
+        cur_univ = universe_tag(getattr(config, 'UNIVERSE', None))
+        if saved_univ is not None and saved_univ != cur_univ:
+            print(f"WARNING: universe mismatch — "
+                  f"trained={saved_univ}, current={cur_univ}")
         for key, cur in {'HIDDEN_DIM': config.HIDDEN_DIM,
                          'SEQ_LEN': config.SEQ_LEN,
                          'NUM_HEADS': config.NUM_HEADS,
                          'N_BINS': config.N_BINS,
-                         'N_HOLD': config.N_HOLD,
-                         'N_EXTRA_STATE': config.N_EXTRA_STATE}.items():
+                         'N_HOLD': config.N_HOLD}.items():
             saved = saved_cfg.get(key)
             if saved is not None and saved != cur:
                 print(f"ERROR: config mismatch — {key}: "
@@ -77,7 +81,6 @@ def main():
                   f"  Extra in current: {extra}")
             return
 
-    # Load denoiser if present in checkpoint
     if any(k.startswith('denoiser.') for k in ckpt["encoder"].keys()):
         denoiser = DiffusionDenoiser(
             feature_dim=dynamic_dim,
@@ -90,7 +93,7 @@ def main():
         ).to(device)
         encoder.denoiser = denoiser
 
-    encoder.load_state_dict(ckpt["encoder"], strict=False)
+    encoder.load_state_dict(ckpt["encoder"])
     policy.load_state_dict(ckpt["policy"])
     encoder.eval()
     policy.eval()
@@ -141,7 +144,16 @@ def main():
         port_state = build_port_state(env, device)
 
         with torch.no_grad():
-            enc = encoder(dyn_t, stat_t)
+            enc_bs = getattr(config, 'ENCODER_BATCH_SIZE', 0)
+            n_stocks = dyn_t.shape[0]
+            if enc_bs > 0 and n_stocks > enc_bs:
+                enc_parts = []
+                for _i in range(0, n_stocks, enc_bs):
+                    _end = min(_i + enc_bs, n_stocks)
+                    enc_parts.append(encoder(dyn_t[_i:_end], stat_t[_i:_end]))
+                enc = torch.cat(enc_parts, dim=0)
+            else:
+                enc = encoder(dyn_t, stat_t)
             dist = policy(enc, port_state, mask_t, phase)
             action = dist.probs.argmax(dim=-1)
 
@@ -191,12 +203,10 @@ def main():
                         "limit_down": limit_down[i],
                     })
 
-        # step() 会修改 env.phase，捕获返回值避免重复计算
-        state, reward, done, info = env.step(target_w)
+        env.step(target_w)
 
-        # 使用 step 返回的 nav，而非重新计算
-        nav_after = info['nav']
-        if env.cash > config.MAX_CASH and not done:
+        nav_after = env._compute_nav()
+        if env.cash > config.MAX_CASH:
             remaining = env.cash - config.MAX_CASH
             ranked = sorted(
                 [(target_w[i], i) for i in top_k_idx
@@ -218,8 +228,6 @@ def main():
                     remaining -= cost
                     if remaining < prices[i] * config.LOT:
                         break
-        if done:
-            break
 
     result_df = pd.DataFrame(orders)
     out_path = os.path.join(config.CACHE_DIR, "latest_rl_signals.csv")

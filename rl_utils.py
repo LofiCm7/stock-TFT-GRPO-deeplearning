@@ -1,10 +1,10 @@
 """Shared utilities for RL pipeline (train_rl, backtest_rl, predict_rl)."""
+import random
 import numpy as np
 import torch
 
 import config
-from feature_engine import STATIC_FEATURES, STATIC_CATEGORICAL, STATIC_CONTINUOUS
-from dataset import rolling_normalize_window
+from feature_engine import STATIC_CATEGORICAL
 
 
 class ObsCache:
@@ -50,19 +50,33 @@ class ObsCache:
 
     def get_obs(self, date_idx, env, device):
         seq_len = self.seq_len
-        n = self.n_stocks
 
-        valid = (date_idx >= self.valid_start) & (date_idx < self.n_dates)
-        windows = self.dynamic_matrix[:, date_idx - seq_len + 1:date_idx + 1, :]
+        # phase-aware observation window (anti look-ahead):
+        #   open  -> decision at T's OPEN: may only use info up to T-1 close,
+        #            so the window must END at T-1 (T's row is unknown yet).
+        #   close -> decision at T's CLOSE: T's row is already realized and we
+        #            also execute at T close, so ending at T is legitimate.
+        end = date_idx if env.phase == "close" else date_idx - 1
+        start = end - seq_len + 1
 
-        mean = np.nanmean(windows, axis=1, keepdims=True)
-        std = np.nanstd(windows, axis=1, keepdims=True, ddof=0) + 1e-8
-        normalized = (windows - mean) / std
-        normalized = np.nan_to_num(normalized, 0.0)
+        if start < 0:
+            # insufficient history (only at the very earliest dates; all three
+            # callers guard date_idx >= SEQ_LEN so this is defensive).
+            normalized = np.zeros(
+                (self.n_stocks, seq_len, self.n_feat), dtype=np.float32)
+            valid = np.zeros(self.n_stocks, dtype=bool)
+        else:
+            valid = (end >= self.valid_start) & (date_idx < self.n_dates)
+            windows = self.dynamic_matrix[:, start:end + 1, :]
+            mean = np.nanmean(windows, axis=1, keepdims=True)
+            std = np.nanstd(windows, axis=1, keepdims=True, ddof=0) + 1e-8
+            normalized = (windows - mean) / std
+            normalized = np.nan_to_num(normalized, 0.0)
+            normalized[~valid] = 0.0
 
-        normalized[~valid] = 0.0
         mask_arr = valid & ~env.suspended[date_idx]
 
+        # stock_age is calendar-deterministic (known at open), not look-ahead.
         stock_ages = self.stock_age_matrix[:, date_idx:date_idx + 1]
         stat_full = np.concatenate(
             [self.static_cat_arr, stock_ages], axis=-1)
@@ -71,37 +85,6 @@ class ObsCache:
         stat_t = torch.tensor(stat_full, device=device)
         mask_t = torch.tensor(mask_arr, device=device, dtype=torch.bool)
         return dyn_t, stat_t, mask_t
-
-
-def get_obs_for_date(grouped, avail_features, date_idx, env, seq_len, device):
-    """Build encoder input tensors for all stocks at a given date."""
-    date = env.dates[date_idx]
-    codes = env.codes
-    n = len(codes)
-    n_feat = len(avail_features)
-
-    dyn_arr = np.zeros((n, seq_len, n_feat), dtype=np.float32)
-    stat_arr = np.zeros((n, len(STATIC_FEATURES)), dtype=np.float32)
-    mask_arr = np.zeros(n, dtype=bool)
-
-    for i, code in enumerate(codes):
-        if code not in grouped.groups:
-            continue
-        stock_df = grouped.get_group(code)
-        date_pos = stock_df[stock_df['trade_date'] <= date]
-        if len(date_pos) < seq_len:
-            continue
-        dynamic_data = date_pos[avail_features].values.astype(np.float32)
-        dyn_arr[i] = rolling_normalize_window(
-            dynamic_data, seq_len, len(dynamic_data))
-        stat_arr[i] = date_pos[STATIC_FEATURES].iloc[0].values.astype(
-            np.float32)
-        mask_arr[i] = not env.suspended[date_idx, i]
-
-    dyn_t = torch.tensor(dyn_arr, device=device)
-    stat_t = torch.tensor(stat_arr, device=device)
-    mask_t = torch.tensor(mask_arr, device=device, dtype=torch.bool)
-    return dyn_t, stat_t, mask_t
 
 
 def build_port_state(env, device):
@@ -125,3 +108,35 @@ def build_port_state(env, device):
     state = np.stack([cash_frac, hold_frac, lock_frac, prev_w,
                       ep_progress, is_last], axis=-1)
     return torch.tensor(state, device=device)
+
+
+def randomize_portfolio_state(env, date_idx):
+    """Randomly initialize portfolio state so policy trains on diverse conditions."""
+    prices = env.close_prices[date_idx]
+    valid = ~np.isnan(prices) & (prices > 0)
+    valid_indices = np.where(valid)[0]
+
+    if len(valid_indices) == 0 or random.random() < 0.2:
+        return
+
+    n_held = random.randint(1, min(config.N_HOLD, len(valid_indices)))
+    held_indices = np.random.choice(valid_indices, size=n_held, replace=False)
+
+    cash_frac = random.uniform(0.1, 0.6)
+    invest_capital = env.init_capital * (1 - cash_frac)
+    env.cash = env.init_capital * cash_frac
+
+    weights = np.random.dirichlet(np.ones(n_held))
+    for j, idx in enumerate(held_indices):
+        shares = int(weights[j] * invest_capital / prices[idx]
+                     / config.LOT) * config.LOT
+        if random.random() < 0.3:
+            env.locked[idx] = shares
+        else:
+            env.holdings[idx] = shares
+
+    nav = env._compute_nav(prices)
+    if nav > 0:
+        total_held = (env.holdings + env.locked).astype(np.float64)
+        env.prev_weights = (total_held * prices) / nav
+        env.prev_weights = np.nan_to_num(env.prev_weights, 0.0)

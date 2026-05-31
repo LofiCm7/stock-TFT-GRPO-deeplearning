@@ -1,12 +1,13 @@
 import copy
 import numpy as np
 import torch
+import torch.nn.functional as F
 import config
-from rl_utils import build_port_state
+from rl_utils import build_port_state, randomize_portfolio_state
 
 
 class GRPOTrainer:
-    def __init__(self, encoder, policy, env,
+    def __init__(self, encoder, policy, env, return_predictor=None,
                  G=config.GRPO_G, beta=config.GRPO_BETA,
                  lr_policy=config.LR_POLICY, lr_encoder=config.LR_ENCODER,
                  ref_refresh_steps=config.GRPO_REF_REFRESH,
@@ -14,51 +15,111 @@ class GRPOTrainer:
         self.encoder = encoder
         self.policy = policy
         self.env = env
+        self.return_predictor = return_predictor
         self.G = G
         self.beta = beta
         self.ref_refresh_steps = ref_refresh_steps
         self.device = device
         self.step_count = 0
+        self.use_amp = (device != "cpu" and
+                        torch.cuda.is_available())
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
 
         self.ref_policy = copy.deepcopy(policy)
         self.ref_policy.eval()
         for p in self.ref_policy.parameters():
             p.requires_grad = False
 
-        # Train encoder and policy jointly from the start
         self.optimizer_policy = torch.optim.Adam(
             policy.parameters(), lr=lr_policy)
         self.optimizer_encoder = torch.optim.Adam(
             encoder.parameters(), lr=lr_encoder)
+        if return_predictor is not None:
+            self.optimizer_aux = torch.optim.Adam(
+                return_predictor.parameters(), lr=lr_policy)
 
     def _maybe_refresh_ref(self):
         if self.step_count % self.ref_refresh_steps == 0 and self.step_count > 0:
             self.ref_policy.load_state_dict(self.policy.state_dict())
 
+    def _print_diag(self, rewards_t, advantages, action_hashes,
+                    policy_loss, kl_avg, aux_loss_val,
+                    policy_gnorm, enc_gnorm, entropy_avg=None,
+                    n_kept=None):
+        r = rewards_t.detach().float()
+        a = advantages.detach().float()
+        n_unique = len(set(action_hashes)) if action_hashes else 0
+        pl = policy_loss.item()
+        kl_term = self.beta * kl_avg.item()
+        aux_term = config.LAMBDA_AUX * aux_loss_val
+        print(f"  [DIAG step {self.step_count}]"
+              + ("  (SMOKE)" if config.DIAG_SMOKE_TEST else ""))
+        print(f"    D1 reward   : mean={r.mean():.6f} std={r.std():.6f} "
+              f"min={r.min():.6f} max={r.max():.6f}")
+        print(f"    D1 advantage: mean={a.mean():.6f} std={a.std():.6f} "
+              f"min={a.min():.6f} max={a.max():.6f}")
+        print(f"    D2 traj div : {n_unique}/{self.G} unique action seqs")
+        print(f"    D3 grad norm: encoder={enc_gnorm:.6f} "
+              f"policy={policy_gnorm:.6f}")
+        print(f"    D4 loss part: policy={pl:.6f} "
+              f"kl_term={kl_term:.6f} aux_term={aux_term:.6f}")
+        # D5: 借鉴#1 (DAPO) — 监控策略熵，及早发现熵坍塌（趋零=失去探索）。
+        #     仅在有效股票上平均（被 mask 的股票 logits=-1e4 接近均匀，熵虚高）。
+        if entropy_avg is not None:
+            print(f"    D5 entropy  : {entropy_avg:.6f} (valid-stock mean)")
+        # D6: 借鉴#3 (GFPO) — 实际保留参与梯度的轨迹数 / G。
+        if n_kept is not None:
+            print(f"    D6 gfpo keep: {n_kept}/{self.G} trajectories")
+
     def collect_trajectory_and_update(self, env, obs_cache, start_idx, device):
         """Run G full episodes from start_idx, compute trajectory-level GRPO.
 
-        KL divergence is computed per-step across the trajectory and averaged,
-        rather than only at the start, to better reflect the full policy shift.
+        KL divergence is computed per-step across the trajectory and averaged.
+        Noise is sampled once per (date_idx, phase) and shared across G trajectories.
         """
         self._maybe_refresh_ref()
+
+        diag_on = (config.DIAG_INTERVAL > 0 and
+                   self.step_count % config.DIAG_INTERVAL == 0)
 
         bins = torch.tensor(config.BINS, device=device, dtype=torch.float32)
         init_env = env.clone()
 
+        # DIAG5: smoke test 用确定性合成 alpha 替代真实奖励，隔离金融噪声
+        if config.DIAG_SMOKE_TEST and not hasattr(self, "_synth_alpha"):
+            n = init_env.n_stocks
+            self._synth_alpha = np.sin(np.arange(n) * 0.7).astype(np.float32)
+
         trajectory_rewards = []
-        trajectory_log_probs = []
+        trajectory_turnovers = []  # 借鉴#4: 每条轨迹的总换手（用于 GFPO 过滤指标）
+        trajectory_step_rewards = []  # #3: 每条轨迹的逐步 reward 列表 [G][T]
+        trajectory_step_logps = []    # #4: 每条轨迹的逐步 per-stock log_prob [G][T][N_HOLD]
+        trajectory_step_stock_returns = []  # #4: 每条轨迹的逐步 per-stock 收益 [G][T][N_HOLD]
         trajectory_kls = []
+        noise_cache = {}
+        aux_enc_list = []
+        aux_ret_list = []
+        traj_action_hashes = []  # DIAG2: 每条轨迹的动作序列哈希
+        enc_cache = {}   # #1: (date_idx, phase) -> enc，G 条轨迹复用同一编码器前向
+        mask_cache = {}  # #1: (date_idx, phase) -> mask_t（与持仓无关，可复用）
+        # 借鉴#1 (DAPO)：熵监控累加器（仅 diag_on 时计算，零额外开销）
+        entropy_sum = 0.0
+        entropy_count = 0
 
         for g in range(self.G):
             env_g = init_env.clone()
             env_g.reset(start_date_idx=start_idx,
                         episode_len=config.EPISODE_LEN)
+            randomize_portfolio_state(env_g, start_idx)
             total_reward = 0.0
-            total_log_prob = torch.tensor(0.0, device=device)
+            total_turnover = 0.0  # 借鉴#4: 本条轨迹累计换手
+            step_logps = []   # #4: 本条轨迹每一步的 per-stock log_prob [N_HOLD]
+            step_rewards = []  # #3: 本条轨迹每一步的即时 reward（float）
+            step_stock_returns = []  # #4: 本条轨迹每一步的 per-stock 收益 [N_HOLD]
             total_kl = torch.tensor(0.0, device=device)
             n_steps = 0
             done = False
+            traj_actions = []  # DIAG2: 本条轨迹的动作序列
 
             for day in range(config.EPISODE_LEN):
                 if done:
@@ -66,22 +127,81 @@ class GRPOTrainer:
                 date_idx = env_g.current_idx
                 for phase in ["open", "close"]:
                     env_g.phase = phase
-                    dyn_t, stat_t, mask_t = obs_cache.get_obs(
-                        date_idx, env_g, device)
+                    cache_key = (date_idx, phase)
+
+                    # #1: encoder 前向只依赖 (date_idx, phase)，与持仓无关，
+                    # 故 G 条轨迹复用同一个 enc / mask（编码器是最贵的部分）。
+                    if cache_key in enc_cache:
+                        enc = enc_cache[cache_key]
+                        mask_t = mask_cache[cache_key]
+                    else:
+                        dyn_t, stat_t, mask_t = obs_cache.get_obs(
+                            date_idx, env_g, device)
+                        if cache_key not in noise_cache:
+                            noise_cache[cache_key] = torch.randn_like(dyn_t)
+                        shared_noise = noise_cache[cache_key]
+                        enc_bs = getattr(config, 'ENCODER_BATCH_SIZE', 0)
+                        n_stocks = dyn_t.shape[0]
+                        if enc_bs > 0 and n_stocks > enc_bs:
+                            enc_parts = []
+                            for _i in range(0, n_stocks, enc_bs):
+                                _end = min(_i + enc_bs, n_stocks)
+                                with torch.amp.autocast('cuda',
+                                                        enabled=self.use_amp):
+                                    enc_parts.append(self.encoder(
+                                        dyn_t[_i:_end], stat_t[_i:_end],
+                                        denoise_noise=shared_noise[_i:_end]))
+                            enc = torch.cat(enc_parts, dim=0)
+                        else:
+                            with torch.amp.autocast('cuda',
+                                                    enabled=self.use_amp):
+                                enc = self.encoder(dyn_t, stat_t,
+                                                   denoise_noise=shared_noise)
+                        enc_cache[cache_key] = enc
+                        mask_cache[cache_key] = mask_t
+
+                    # port_state 依赖持仓，必须逐轨迹计算（policy 是廉价 MLP）。
                     port_state = build_port_state(env_g, device)
-
-                    enc = self.encoder(dyn_t, stat_t)
-                    cur_dist = self.policy(enc, port_state, mask_t, phase)
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        cur_dist = self.policy(enc, port_state, mask_t, phase)
                     action = cur_dist.sample()
-                    lp = cur_dist.log_prob(action)
-                    if lp.dim() > 0:
-                        lp = lp.mean()
-                    total_log_prob = total_log_prob + lp
+                    if diag_on:
+                        traj_actions.append(action.detach())
+                    # #2: 先取每只股票的 log_prob，待持仓确定后再筛选累加（见下方）
+                    lp_all = cur_dist.log_prob(action)
 
-                    # Per-step KL divergence against reference policy
+                    # 借鉴#1 (DAPO)：仅在有效股票上累加策略熵用于监控。
+                    # 被 mask 的股票 logits=-1e4 接近均匀分布、熵虚高，须排除。
+                    if diag_on:
+                        ent_all = cur_dist.entropy()
+                        if mask_t is not None and mask_t.any():
+                            ent_val = ent_all[mask_t].mean()
+                        else:
+                            ent_val = ent_all.mean()
+                        entropy_sum += float(ent_val.detach())
+                        entropy_count += 1
+
+                    if self.return_predictor is not None and g == 0:
+                        date_idx_cur = env_g.current_idx
+                        if date_idx_cur > 0:
+                            prev_close = env_g.close_prices[date_idx_cur - 1]
+                            cur_close = env_g.close_prices[date_idx_cur]
+                            stock_ret = cur_close / prev_close - 1.0
+                            valid = np.isfinite(stock_ret)
+                            if valid.any():
+                                valid_t = torch.tensor(valid, device=device)
+                                ret_t = torch.tensor(
+                                    np.nan_to_num(stock_ret, 0.0),
+                                    device=device, dtype=torch.float32)
+                                aux_enc_list.append(enc.detach()[valid_t])
+                                aux_ret_list.append(ret_t[valid_t])
+
                     with torch.no_grad():
-                        ref_dist = self.ref_policy(enc, port_state, mask_t, phase)
-                    step_kl = torch.distributions.kl_divergence(cur_dist, ref_dist)
+                        with torch.amp.autocast('cuda', enabled=self.use_amp):
+                            ref_dist = self.ref_policy(
+                                enc.detach(), port_state, mask_t, phase)
+                    step_kl = torch.distributions.kl_divergence(
+                        cur_dist, ref_dist)
                     if step_kl.dim() > 1:
                         step_kl = step_kl.mean(dim=-1)
                     total_kl = total_kl + step_kl.mean()
@@ -96,38 +216,172 @@ class GRPOTrainer:
                     if w_sum > 0:
                         target_w = target_w / w_sum
 
-                    _, reward, done, _ = env_g.step(target_w)
+                    # #4: 保留每只持仓股的 log_prob（不再 .mean()），
+                    # 用于 per-stock 截面优势的逐股梯度分配。
+                    hold_idx_t = torch.as_tensor(
+                        np.asarray(top_k_idx), device=device, dtype=torch.long)
+                    lp_per_stock = lp_all[hold_idx_t]  # [N_HOLD]
+                    step_logps.append(lp_per_stock)
+
+                    _, reward, done, info = env_g.step(target_w)
+                    # #4: 收集 per-stock 实现收益（用于截面优势）
+                    per_stock_ret = info.get('per_stock_returns',
+                                            np.zeros(env_g.n_stocks))
+                    held_returns = per_stock_ret[top_k_idx]  # [N_HOLD]
+                    # 借鉴#4: 累加换手用于 GFPO 过滤指标（仅排序，不进梯度/奖励）
+                    total_turnover += float(info.get('turnover', 0.0))
+                    if config.DIAG_SMOKE_TEST:
+                        reward = float(np.dot(target_w, self._synth_alpha))
+                        held_returns = self._synth_alpha[top_k_idx]
+                    step_stock_returns.append(held_returns)
+                    step_rewards.append(reward)
                     total_reward += reward
                     if done:
                         break
 
             trajectory_rewards.append(total_reward)
-            trajectory_log_probs.append(total_log_prob)
+            trajectory_turnovers.append(total_turnover)  # 借鉴#4
+            trajectory_step_rewards.append(step_rewards)
+            trajectory_step_logps.append(step_logps)
+            trajectory_step_stock_returns.append(step_stock_returns)
             trajectory_kls.append(total_kl / max(n_steps, 1))
+
+            if diag_on and traj_actions:
+                flat = torch.cat([a.reshape(-1) for a in traj_actions])
+                traj_action_hashes.append(hash(flat.cpu().numpy().tobytes()))
 
         rewards_t = torch.tensor(trajectory_rewards, device=device,
                                  dtype=torch.float32)
-        reward_std = rewards_t.std()
-        if reward_std < 1e-6:
-            advantages = torch.zeros_like(rewards_t)
-        else:
-            advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
-
-        log_probs_t = torch.stack(trajectory_log_probs)
         kl_avg = torch.stack(trajectory_kls).mean()
 
-        policy_loss = -(advantages.detach() * log_probs_t).mean()
+        # #4: per-stock 截面优势 + return-to-go 时间优势叠加。
+        # 解决原 #3 的核心缺陷：同一步所有持仓股共享标量优势，无法区分个股贡献。
+        gamma = config.GRPO_GAMMA
+        T = min(len(sr) for sr in trajectory_step_rewards)
+        N_HOLD_actual = config.N_HOLD
+        if T == 0:
+            policy_loss = torch.tensor(0.0, device=device)
+            advantages = torch.zeros(self.G, 1, N_HOLD_actual, device=device)
+            n_kept = self.G  # 借鉴#3：空轨迹无可过滤，占位以供诊断打印
+        else:
+            # --- A_temporal: [G, T] return-to-go 跨 G 轨迹 z-score ---
+            returns_mat = torch.zeros(self.G, T, device=device,
+                                      dtype=torch.float32)
+            for g in range(self.G):
+                sr = trajectory_step_rewards[g]
+                acc = 0.0
+                for t in range(T - 1, -1, -1):
+                    acc = sr[t] + gamma * acc
+                    returns_mat[g, t] = acc
+
+            mean_g = returns_mat.mean(dim=0, keepdim=True)
+            std_g = returns_mat.std(dim=0, keepdim=True)
+            A_temporal = (returns_mat - mean_g) / (std_g + 1e-8)
+            A_temporal = torch.where(std_g < 1e-6,
+                                     torch.zeros_like(A_temporal), A_temporal)
+            # 扩展到 [G, T, N_HOLD]（每只持仓股共享时间维度优势）
+            A_temporal = A_temporal.unsqueeze(-1).expand(-1, -1, N_HOLD_actual)
+
+            # --- A_cross: [G, T, N_HOLD] 截面优势，跨持仓股 z-score ---
+            stock_ret_mat = torch.zeros(self.G, T, N_HOLD_actual,
+                                        device=device, dtype=torch.float32)
+            for g in range(self.G):
+                for t in range(T):
+                    stock_ret_mat[g, t] = torch.tensor(
+                        trajectory_step_stock_returns[g][t],
+                        device=device, dtype=torch.float32)
+
+            cross_mean = stock_ret_mat.mean(dim=-1, keepdim=True)
+            cross_std = stock_ret_mat.std(dim=-1, keepdim=True) + 1e-8
+            A_cross = (stock_ret_mat - cross_mean) / cross_std
+            A_cross = torch.where(cross_std < 1e-6,
+                                  torch.zeros_like(A_cross), A_cross)
+
+            # --- 叠加 ---
+            alpha = config.ALPHA_TEMPORAL
+            advantages = alpha * A_temporal + (1 - alpha) * A_cross
+
+            # logp_mat: [G, T, N_HOLD]（每只股票独立的 log_prob）
+            logp_mat = torch.stack(
+                [torch.stack(trajectory_step_logps[g][:T])
+                 for g in range(self.G)])
+
+            # 借鉴#3 (GFPO, 2508.09726)：采 G 条，只对按过滤指标排序的 top-k 条
+            # 算梯度，其余轨迹优势置零（隐式 reward shaping + 降梯度方差）。
+            # 借鉴#4 避坑：过滤指标用【减法】 total_return - KAPPA*total_turnover，
+            # 而非 reward/turnover 比值——避免除零（不交易轨迹 turnover≈0）与
+            # 符号反转（亏损轨迹下比值排序反向）。KAPPA=0 时退化为纯收益排序。
+            # keep_ratio=1.0 时 n_kept==G，完全退回过滤前行为。
+            keep_ratio = getattr(config, 'GFPO_KEEP_RATIO', 1.0)
+            kappa = getattr(config, 'GFPO_TURNOVER_KAPPA', 0.0)
+            n_kept = max(1, int(round(keep_ratio * self.G)))
+            if n_kept < self.G:
+                if kappa != 0.0:
+                    turnover_t = torch.tensor(
+                        trajectory_turnovers, device=device,
+                        dtype=torch.float32)
+                    filter_score = rewards_t - kappa * turnover_t
+                else:
+                    filter_score = rewards_t
+                topk_idx = torch.topk(filter_score, n_kept).indices
+                traj_mask = torch.zeros(self.G, device=device,
+                                        dtype=advantages.dtype)
+                traj_mask[topk_idx] = 1.0
+                advantages = advantages * traj_mask.view(self.G, 1, 1)
+            # 仅在保留的 n_kept 条轨迹上归一化，避免被置零轨迹稀释梯度尺度。
+            denom = n_kept * T * N_HOLD_actual
+            policy_loss = -(advantages.detach() * logp_mat).sum() / denom
+
         loss = policy_loss + self.beta * kl_avg
+
+        aux_loss_val = 0.0
+        if self.return_predictor is not None and aux_enc_list:
+            aux_enc = torch.cat(aux_enc_list, dim=0)
+            aux_target = torch.cat(aux_ret_list, dim=0)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                aux_pred = self.return_predictor(aux_enc)
+            aux_loss = F.mse_loss(aux_pred, aux_target)
+            aux_loss_val = aux_loss.item()
+            loss = loss + config.LAMBDA_AUX * aux_loss
 
         self.optimizer_policy.zero_grad()
         self.optimizer_encoder.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in self.encoder.parameters() if p.requires_grad],
-            1.0)
-        self.optimizer_policy.step()
-        self.optimizer_encoder.step()
+        if self.return_predictor is not None:
+            self.optimizer_aux.zero_grad()
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer_policy)
+            self.scaler.unscale_(self.optimizer_encoder)
+            if self.return_predictor is not None:
+                self.scaler.unscale_(self.optimizer_aux)
+            policy_gnorm = torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), 1.0)
+            enc_gnorm = torch.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), 1.0)
+            self.scaler.step(self.optimizer_policy)
+            self.scaler.step(self.optimizer_encoder)
+            if self.return_predictor is not None:
+                self.scaler.step(self.optimizer_aux)
+            self.scaler.update()
+        else:
+            loss.backward()
+            policy_gnorm = torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), 1.0)
+            enc_gnorm = torch.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), 1.0)
+            self.optimizer_policy.step()
+            self.optimizer_encoder.step()
+            if self.return_predictor is not None:
+                self.optimizer_aux.step()
+
+        if diag_on:
+            entropy_avg = (entropy_sum / entropy_count
+                           if entropy_count > 0 else None)
+            self._print_diag(
+                rewards_t, advantages, traj_action_hashes,
+                policy_loss, kl_avg, aux_loss_val,
+                float(policy_gnorm), float(enc_gnorm),
+                entropy_avg=entropy_avg, n_kept=n_kept)
 
         self.step_count += 1
         return {

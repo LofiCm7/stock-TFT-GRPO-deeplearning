@@ -15,10 +15,6 @@ def rolling_normalize_window(dynamic_data, seq_len, end_idx):
     Uses the rolling mean/std computed over the window itself (same logic as
     _build_samples). This is the public helper for env.py to reuse.
 
-    NOTE: This function uses window.mean()/std() (no NaN handling).
-    For NaN-safe normalization (matching ObsCache behavior), use
-    np.nanmean/np.nanstd instead.
-
     Args:
         dynamic_data: np.ndarray of shape (T, num_features), full history for one stock
         seq_len: window length

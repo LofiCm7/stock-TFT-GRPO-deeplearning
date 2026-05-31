@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.utils.checkpoint import checkpoint
 import config
 
 
@@ -117,7 +118,10 @@ class StaticEmbedding(nn.Module):
     def forward(self, static_x):
         cat_embeds = []
         for i, emb in enumerate(self.embeddings):
-            cat_embeds.append(emb(static_x[:, i].long()))
+            # 保护：将输入 clamp 到 [0, num_embeddings-1]，防止数据中
+            # 出现训练集未见过的类别编码导致 IndexError。
+            idx = static_x[:, i].long().clamp(0, emb.num_embeddings - 1)
+            cat_embeds.append(emb(idx))
         cat_concat = torch.cat(cat_embeds, dim=-1)
 
         if self.n_continuous > 0:
@@ -212,7 +216,11 @@ class TFTEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.denoiser = denoiser
 
-        self.dynamic_embedding = nn.Linear(1, hidden_dim)
+        # 每个特征独立投影到 hidden_dim（nn.Linear(1, hidden_dim) 所有特征共享权重，
+        # 表达能力弱）。改用 ModuleList 让每个特征有独立的 Linear(1, hidden_dim)。
+        self.dynamic_embedding = nn.ModuleList([
+            nn.Linear(1, hidden_dim) for _ in range(dynamic_input_dim)
+        ])
         if static_categorical is not None:
             self.static_embedding = StaticEmbedding(
                 static_categorical, static_n_continuous,
@@ -235,7 +243,7 @@ class TFTEncoder(nn.Module):
         self.post_attn_grn = GatedResidualNetwork(
             hidden_dim, hidden_dim, dropout=dropout)
 
-    def forward(self, dynamic_x, static_x):
+    def forward(self, dynamic_x, static_x, denoise_noise=None):
         seq_len = dynamic_x.shape[1]
 
         if self.denoiser is not None:
@@ -243,7 +251,12 @@ class TFTEncoder(nn.Module):
                 t_start = config.DENOISE_T_START
                 sqrt_ac = self.denoiser.sqrt_alpha_cumprod[t_start]
                 sqrt_omac = self.denoiser.sqrt_one_minus_alpha_cumprod[t_start]
-                noise = torch.randn_like(dynamic_x)
+                if denoise_noise is not None:
+                    noise = denoise_noise
+                elif not self.training:
+                    noise = torch.zeros_like(dynamic_x)
+                else:
+                    noise = torch.randn_like(dynamic_x)
                 x_noisy = sqrt_ac * dynamic_x + sqrt_omac * noise
                 denoised = self.denoiser.denoise(
                     x_noisy,
@@ -252,7 +265,20 @@ class TFTEncoder(nn.Module):
                 )
             dynamic_x = denoised.detach()
 
-        embedded_dynamic = self.dynamic_embedding(dynamic_x.unsqueeze(-1))
+        if self.training:
+            return checkpoint(
+                self._forward_body, dynamic_x, static_x,
+                use_reentrant=False)
+        else:
+            return self._forward_body(dynamic_x, static_x)
+
+    def _forward_body(self, dynamic_x, static_x):
+        seq_len = dynamic_x.shape[1]
+        # dynamic_x: [batch, seq_len, n_features] -> [batch, seq_len, n_features, hidden_dim]
+        # 每个特征独立投影，保留特征维度供 VSN 使用
+        embedded_dynamic = torch.stack(
+            [emb(dynamic_x[..., i:i+1]) for i, emb in enumerate(self.dynamic_embedding)],
+            dim=-2)
         selected_features = self.vsn(embedded_dynamic)
 
         pos_ids = torch.arange(seq_len, device=dynamic_x.device)
@@ -271,6 +297,7 @@ class TFTEncoder(nn.Module):
         final_features = self.post_attn_grn(gated_attn)
 
         return final_features[:, -1, :]
+
 
 
 class PortfolioPolicy(nn.Module):
@@ -297,5 +324,18 @@ class PortfolioPolicy(nn.Module):
         else:
             logits = self.head_close(x)
         if mask is not None:
-            logits = logits.masked_fill(~mask.unsqueeze(-1), -1e9)
+            logits = logits.masked_fill(~mask.unsqueeze(-1), -1e4)
         return torch.distributions.Categorical(logits=logits)
+
+
+class ReturnPredictor(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, enc_features):
+        return self.head(enc_features).squeeze(-1)

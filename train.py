@@ -1,26 +1,15 @@
-"""
-Diffusion Denoiser Pre-training
-
-Pre-trains the DiffusionDenoiser on dynamic features from the merged dataset.
-The trained denoiser can then be loaded and frozen in train_rl.py to help
-stabilize the denoising process (TFTEncoder.forward).
-
-This script uses the same data pipeline as train_rl.py:
-  build_merged_dataset() -> build_features() -> extract dynamic arrays
-
-Usage:
-    python train.py
-"""
 import os
 import random
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-
-import config
-from data_loader import build_merged_dataset
-from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from torch.utils.data import DataLoader
 from model import DiffusionDenoiser
+from dataset import StockDataset
+from data_loader import build_merged_dataset, universe_tag
+from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
+from plot import plot_training_curves
+import config
 
 
 SEED = 42
@@ -34,45 +23,15 @@ def set_seed(seed=SEED):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_denoiser_dataset(df, avail_features, seq_len):
-    """Extract sliding windows of dynamic features from the merged DataFrame.
-
-    For each stock, extract all valid [seq_len] windows and normalize
-    using the window's own mean/std (same logic as ObsCache / dataset.py).
-
-    Returns:
-        windows: np.ndarray of shape (N, seq_len, n_features)
-    """
-    print("Building denoiser training samples...")
-    windows = []
-    grouped = df.sort_values('trade_date').groupby('ts_code')
-
-    for code, group in grouped:
-        data = group[avail_features].values.astype(np.float32)
-        n = len(data)
-        if n < seq_len + 1:
-            continue
-
-        for i in range(seq_len, n):
-            window = data[i - seq_len:i]
-            if np.any(np.isnan(window)):
-                continue
-            mean = window.mean(axis=0, keepdims=True)
-            std = window.std(axis=0, keepdims=True, ddof=0) + 1e-8
-            normed = (window - mean) / std
-            windows.append(np.nan_to_num(normed, 0.0))
-
-    windows = np.stack(windows, axis=0).astype(np.float32)
-    print(f"Total samples: {len(windows)}, shape: {windows.shape}")
-    return windows
+def worker_init_fn(worker_id):
+    np.random.seed(SEED + worker_id)
 
 
-def train_denoiser(denoiser, loader, optimizer, device, scaler=None):
-    """Train the diffusion denoiser for one epoch."""
+def train_one_epoch(denoiser, loader, optimizer, device, scaler=None):
     denoiser.train()
-    total_loss = 0.0
+    total_loss = 0
     n = 0
-    for x_dyn, in loader:
+    for x_dyn, x_stat, y in loader:
         x_dyn = x_dyn.to(device)
         optimizer.zero_grad()
         with torch.amp.autocast('cuda', enabled=scaler is not None):
@@ -92,36 +51,48 @@ def train_denoiser(denoiser, loader, optimizer, device, scaler=None):
     return total_loss / n
 
 
-def main():
-    if not config.USE_DIFFUSION_DENOISER:
-        print("USE_DIFFUSION_DENOISER=False, skipping denoiser pretraining.")
-        return
+@torch.no_grad()
+def evaluate(denoiser, loader, device):
+    denoiser.eval()
+    total_loss = 0
+    n = 0
+    for x_dyn, x_stat, y in loader:
+        x_dyn = x_dyn.to(device)
+        loss = denoiser.compute_loss(x_dyn)
+        total_loss += loss.item() * len(x_dyn)
+        n += len(x_dyn)
+    return total_loss / n
 
+
+def main():
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ---- Data pipeline (same as train_rl.py) ----
     print("Loading data...")
     df = build_merged_dataset(start_date=config.TRAIN_START,
                               end_date=config.VAL_END)
     print("Building features...")
     df, avail_features = build_features(df)
 
-    # Use only training period
     train_df = df[df['trade_date'] <= config.TRAIN_END]
-    print(f"Train rows: {len(train_df)}")
+    val_df = df[df['trade_date'] >= config.VAL_START]
+    print(f"Train: {len(train_df)} rows, Val: {len(val_df)} rows")
 
-    # Build sliding-window samples
-    windows = build_denoiser_dataset(train_df, avail_features, config.SEQ_LEN)
+    print("Building datasets...")
+    train_ds = StockDataset(train_df, avail_features, STATIC_FEATURES,
+                            cache_tag="train")
+    val_ds = StockDataset(val_df, avail_features, STATIC_FEATURES,
+                          cache_tag="val")
+    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
-    # ---- DataLoader ----
-    dataset = TensorDataset(torch.from_numpy(windows))
-    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE,
-                        shuffle=True, num_workers=4, pin_memory=True,
-                        worker_init_fn=lambda wid: np.random.seed(SEED + wid))
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE,
+                              shuffle=True, num_workers=4, pin_memory=True,
+                              worker_init_fn=worker_init_fn)
+    val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE,
+                            shuffle=False, num_workers=4, pin_memory=True,
+                            worker_init_fn=worker_init_fn)
 
-    # ---- Model ----
     denoiser = DiffusionDenoiser(
         feature_dim=len(avail_features),
         seq_len=config.SEQ_LEN,
@@ -133,21 +104,61 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=config.LR)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.EPOCHS)
 
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    # ---- Training ----
+    best_val_loss = float('inf')
+    patience_counter = 0
     os.makedirs(config.CACHE_DIR, exist_ok=True)
-    denoiser_path = os.path.join(config.CACHE_DIR, "denoiser_pretrained.pt")
+    save_path = os.path.join(config.CACHE_DIR, "denoiser_pretrained.pt")
+    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'icir': []}
 
-    print(f"Training denoiser for {config.EPOCHS} epochs...")
     for epoch in range(config.EPOCHS):
-        train_loss = train_denoiser(denoiser, loader, optimizer, device, scaler)
-        print(f"Epoch {epoch + 1:02d} | Denoiser Loss: {train_loss:.6f}")
+        train_loss = train_one_epoch(denoiser, train_loader, optimizer,
+                                     device, scaler)
+        val_loss = evaluate(denoiser, val_loader, device)
+        scheduler.step()
 
-    torch.save(denoiser.state_dict(), denoiser_path)
-    print(f"Denoiser saved to: {denoiser_path}")
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['ic'].append(0.0)
+        history['icir'].append(0.0)
+
+        lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1:02d} | "
+              f"Train Loss: {train_loss:.6f} | "
+              f"Val Loss: {val_loss:.6f} | "
+              f"LR: {lr:.2e}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save({
+                'denoiser_state': denoiser.state_dict(),
+                'config': {
+                    'UNIVERSE': universe_tag(getattr(config, 'UNIVERSE', None)),
+                    'SEQ_LEN': config.SEQ_LEN,
+                    'DIFFUSION_T': config.DIFFUSION_T,
+                    'DIFFUSION_HIDDEN_DIM': config.DIFFUSION_HIDDEN_DIM,
+                    'DIFFUSION_TIME_DIM': config.DIFFUSION_TIME_DIM,
+                    'DIFFUSION_BETA_START': config.DIFFUSION_BETA_START,
+                    'DIFFUSION_BETA_END': config.DIFFUSION_BETA_END,
+                    'DYNAMIC_FEATURES': avail_features,
+                },
+            }, save_path)
+            print(f"  -> Saved best denoiser (val_loss={best_val_loss:.6f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= config.PATIENCE:
+                print("Early stopping.")
+                break
+
+    plot_training_curves(history)
+    print(f"\nTraining done. Best val_loss: {best_val_loss:.6f}")
+    print(f"Denoiser saved to: {save_path}")
 
 
 if __name__ == "__main__":
