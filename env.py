@@ -3,6 +3,27 @@ import pandas as pd
 import config
 
 
+def _is_star_code(code):
+    """判断股票代码是否为科创板（688xxx）。"""
+    return code.startswith('688')
+
+
+def _round_to_lot(shares, lot):
+    """将股数向下取整到最小交易单位的整数倍。
+    
+    科创板（lot=200）：超过 200 后以 1 股递增，即只保证 >=200 且为整数即可。
+    主板/创业板（lot=100）：以 100 股递增。
+    """
+    if lot == 200:
+        # 科创板：200 股起，之后 1 股递增
+        if shares < 200:
+            return 0
+        return int(shares)  # 直接取整，>=200 即可
+    else:
+        # 主板/创业板：100 股递增
+        return int(shares / lot) * lot
+
+
 class AShareTradingEnv:
     def __init__(self, panel_df, init_capital=config.INIT_CAPITAL,
                  lot=config.LOT, commission=config.COMMISSION,
@@ -16,7 +37,19 @@ class AShareTradingEnv:
         self.limit_pct = limit_pct
 
         self._prepare_panel(panel_df)
+        self._build_lots()
         self._load_benchmark_returns()
+
+    def _build_lots(self):
+        """根据股票代码构建 per-stock 最小交易单位数组。
+        
+        科创板（688xxx）：200 股
+        其他（主板/创业板）：100 股
+        """
+        self.lots = np.array([
+            config.STAR_LOT if _is_star_code(code) else config.LOT
+            for code in self.codes
+        ], dtype=np.int64)
 
     def _prepare_panel(self, panel_df):
         self.codes = sorted(panel_df['ts_code'].unique())
@@ -169,7 +202,8 @@ class AShareTradingEnv:
         for i in range(self.n_stocks):
             if np.isnan(prices[i]) or prices[i] <= 0:
                 continue
-            target_shares[i] = int(target_values[i] / prices[i] / self.lot) * self.lot
+            raw_shares = target_values[i] / prices[i]
+            target_shares[i] = _round_to_lot(raw_shares, self.lots[i])
 
         available = self.holdings.copy()
         sell_shares = np.maximum(available - target_shares, 0)
@@ -199,8 +233,8 @@ class AShareTradingEnv:
             comm = max(cost * self.commission, self.min_commission)
             total = cost + comm
             if total > self.cash:
-                shares = int(self.cash / (prices[i] * (1 + self.commission))
-                             / self.lot) * self.lot
+                raw_shares = self.cash / (prices[i] * (1 + self.commission))
+                shares = _round_to_lot(raw_shares, self.lots[i])
                 if shares <= 0:
                     continue
                 cost = shares * prices[i]
@@ -275,8 +309,8 @@ class AShareTradingEnv:
         excess = self.cash - config.MAX_CASH
         for j, idx in enumerate(buyable):
             alloc = excess * weights[j]
-            shares = int(alloc / (prices[idx] * (1 + self.commission))
-                         / self.lot) * self.lot
+            raw_shares = alloc / (prices[idx] * (1 + self.commission))
+            shares = _round_to_lot(raw_shares, self.lots[idx])
             if shares <= 0:
                 continue
             cost = shares * prices[idx]

@@ -128,8 +128,8 @@ def randomize_portfolio_state(env, date_idx):
 
     weights = np.random.dirichlet(np.ones(n_held))
     for j, idx in enumerate(held_indices):
-        shares = int(weights[j] * invest_capital / prices[idx]
-                     / config.LOT) * config.LOT
+        raw_shares = weights[j] * invest_capital / prices[idx]
+        shares = int(raw_shares / env.lots[idx]) * env.lots[idx]
         if random.random() < 0.3:
             env.locked[idx] = shares
         else:

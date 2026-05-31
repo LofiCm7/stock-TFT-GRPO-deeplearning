@@ -90,8 +90,14 @@ LAMBDA_TURNOVER = 5e-5
 COMMISSION = 3e-4
 STAMP = 1e-3
 MIN_COMMISSION = 5.0
+# 涨跌停板限制：主板 ±10%，创业板/科创板 ±20%。
+# 运行时 env 根据股票代码动态决定 per-stock limit_pct。
 LIMIT_PCT = 0.10
+GEM_STAR_LIMIT_PCT = 0.20  # 创业板（300/301）和科创板（688）
+# A股最小交易单位：主板/创业板 100股，科创板 200股。
+# 运行时 env 会根据股票代码动态决定 per-stock lot，此处仅作默认值。
 LOT = 100
+STAR_LOT = 200  # 科创板（688xxx）最小交易单位
 RL_STEPS = 3000
 LR_POLICY = 3e-4
 LR_ENCODER = 1e-4

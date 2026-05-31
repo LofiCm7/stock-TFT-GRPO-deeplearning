@@ -177,8 +177,8 @@ def main():
         for i in range(env.n_stocks):
             if np.isnan(prices[i]) or prices[i] <= 0:
                 continue
-            target_shares = int(target_w[i] * nav / prices[i]
-                                / config.LOT) * config.LOT
+            raw_shares = target_w[i] * nav / prices[i]
+            target_shares = int(raw_shares / env.lots[i]) * env.lots[i]
             held = current_holdings[i]
             if target_shares > held:
                 buy_shares = target_shares - held
@@ -213,8 +213,8 @@ def main():
                  if not np.isnan(prices[i]) and prices[i] > 0],
                 key=lambda x: -x[0])
             for _, i in ranked:
-                extra_shares = int(remaining / (prices[i] * (1 + config.COMMISSION))
-                                   / config.LOT) * config.LOT
+                raw_extra = remaining / (prices[i] * (1 + config.COMMISSION))
+                extra_shares = int(raw_extra / env.lots[i]) * env.lots[i]
                 if extra_shares > 0:
                     orders.append({
                         "date": target_date, "phase": phase,
@@ -226,7 +226,7 @@ def main():
                     })
                     cost = extra_shares * prices[i] * (1 + config.COMMISSION)
                     remaining -= cost
-                    if remaining < prices[i] * config.LOT:
+                    if remaining < prices[i] * env.lots[i]:
                         break
 
     result_df = pd.DataFrame(orders)
