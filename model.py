@@ -253,8 +253,6 @@ class TFTEncoder(nn.Module):
                 sqrt_omac = self.denoiser.sqrt_one_minus_alpha_cumprod[t_start]
                 if denoise_noise is not None:
                     noise = denoise_noise
-                elif not self.training:
-                    noise = torch.zeros_like(dynamic_x)
                 else:
                     noise = torch.randn_like(dynamic_x)
                 x_noisy = sqrt_ac * dynamic_x + sqrt_omac * noise
@@ -301,7 +299,7 @@ class TFTEncoder(nn.Module):
 
 
 class PortfolioPolicy(nn.Module):
-    def __init__(self, hidden_dim, n_bins=6, n_extra_state=6, dropout=0.1):
+    def __init__(self, hidden_dim, n_bins=6, n_extra_state=7, dropout=0.1):
         super().__init__()
         input_dim = hidden_dim + n_extra_state
         self.head_open = nn.Sequential(

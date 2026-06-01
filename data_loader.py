@@ -357,12 +357,18 @@ def build_merged_dataset(start_date=None, end_date=None):
 
     top_n = getattr(config, 'UNIVERSE_TOP_N', None)
     if top_n and 'amount' in merged.columns:
-        avg_amount = merged.groupby('ts_code')['amount'].mean()
+        train_end = getattr(config, 'TRAIN_END', None)
+        if train_end:
+            train_mask = merged['trade_date'] <= train_end
+            avg_amount = merged[train_mask].groupby('ts_code')['amount'].mean()
+        else:
+            avg_amount = merged.groupby('ts_code')['amount'].mean()
         top_codes = set(avg_amount.nlargest(top_n).index)
         before_n = merged['ts_code'].nunique()
         merged = merged[merged['ts_code'].isin(top_codes)]
         after_n = merged['ts_code'].nunique()
-        print(f"Liquidity filter: top {top_n} by avg amount, "
+        print(f"Liquidity filter: top {top_n} by avg amount "
+              f"(up to {train_end or 'all'}), "
               f"{before_n} -> {after_n} stocks")
 
     # 过滤新股上市初期数据（前 IPO_SKIP_DAYS 个交易日）
@@ -415,6 +421,21 @@ def build_merged_dataset(start_date=None, end_date=None):
     merged.to_pickle(cache_path)
     print(f"Saved merged data to {cache_path}, shape: {merged.shape}")
     return merged
+
+
+def load_daily_open_for_date(date, stock_pool=None):
+    """加载指定日期的 daily_open 数据。
+
+    Returns:
+        DataFrame with columns [ts_code, open, pre_close], or None if not found.
+    """
+    path = os.path.join(config.DAILY_OPEN_DIR, f"{date}.csv")
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path, dtype={"ts_code": str, "trade_date": str})
+    if stock_pool:
+        df = df[df['ts_code'].isin(stock_pool)]
+    return df
 
 
 if __name__ == "__main__":

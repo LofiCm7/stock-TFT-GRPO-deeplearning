@@ -8,6 +8,11 @@ def _is_star_code(code):
     return code.startswith('688')
 
 
+def _is_gem_code(code):
+    """判断股票代码是否为创业板（300xxx / 301xxx）。"""
+    return code.startswith('300') or code.startswith('301')
+
+
 def _round_to_lot(shares, lot):
     """将股数向下取整到最小交易单位的整数倍。
     
@@ -38,11 +43,12 @@ class AShareTradingEnv:
 
         self._prepare_panel(panel_df)
         self._build_lots()
+        self._build_limit_pcts()
         self._load_benchmark_returns()
 
     def _build_lots(self):
         """根据股票代码构建 per-stock 最小交易单位数组。
-        
+
         科创板（688xxx）：200 股
         其他（主板/创业板）：100 股
         """
@@ -50,6 +56,20 @@ class AShareTradingEnv:
             config.STAR_LOT if _is_star_code(code) else config.LOT
             for code in self.codes
         ], dtype=np.int64)
+
+    def _build_limit_pcts(self):
+        """根据股票代码构建 per-stock 涨跌停幅度数组。
+
+        科创板（688xxx）：±20%
+        创业板（300xxx / 301xxx）：±20%
+        主板（其余）：±10%
+        """
+        self.limit_pcts = np.array([
+            config.GEM_STAR_LIMIT_PCT
+            if _is_star_code(code) or _is_gem_code(code)
+            else config.LIMIT_PCT
+            for code in self.codes
+        ], dtype=np.float64)
 
     def _prepare_panel(self, panel_df):
         self.codes = sorted(panel_df['ts_code'].unique())
@@ -140,35 +160,64 @@ class AShareTradingEnv:
         """Return the appropriate prices for current phase valuation.
 
         open phase: use previous day's close (last known price)
-        close phase: use current day's close
+        close phase: use current day's open (known after morning auction)
         """
         if self.phase == "open":
             if self.current_idx > 0:
                 return self.close_prices[self.current_idx - 1]
             return self.open_prices[self.current_idx]
-        return self.close_prices[self.current_idx]
+        return self.open_prices[self.current_idx]
+
+    def get_execution_prices(self):
+        """Return the execution prices for the current phase.
+
+        These are the prices used for order settlement. We use the last
+        known price at decision time (no look-ahead):
+          open phase  → T-1 close (decision made before T opens)
+          close phase → T open    (decision made after morning auction)
+        """
+        if self.phase == "open":
+            if self.current_idx > 0:
+                return self.close_prices[self.current_idx - 1]
+            return self.open_prices[self.current_idx]
+        return self.open_prices[self.current_idx]
 
     def _limit_prices(self, date_idx):
         pre = self.pre_close_prices[date_idx]
-        limit_up = np.round(pre * (1 + self.limit_pct), 2)
-        limit_down = np.round(pre * (1 - self.limit_pct), 2)
+        limit_up = np.round(pre * (1 + self.limit_pcts), 2)
+        limit_down = np.round(pre * (1 - self.limit_pcts), 2)
         return limit_up, limit_down
 
     def _can_buy(self, date_idx):
+        """Check which stocks can be bought (not suspended, not limit-up).
+
+        Limit-up check uses the actual market price (open for open phase,
+        close for close phase) — this reflects real market constraints,
+        independent of what execution price we use for settlement.
+        """
         limit_up, _ = self._limit_prices(date_idx)
-        prices = self.open_prices[date_idx] if self.phase == "open" \
-            else self.close_prices[date_idx]
-        valid_price = ~np.isnan(prices)
-        hit_limit_up = np.nan_to_num(prices, nan=np.inf) >= limit_up
+        if self.phase == "open":
+            market_prices = self.open_prices[date_idx]
+        else:
+            market_prices = self.close_prices[date_idx]
+        valid_price = ~np.isnan(market_prices)
+        hit_limit_up = np.nan_to_num(market_prices, nan=np.inf) >= limit_up
         mask = ~self.suspended[date_idx] & ~hit_limit_up & valid_price
         return mask
 
     def _can_sell(self, date_idx):
+        """Check which stocks can be sold (not suspended, not limit-down).
+
+        Limit-down check uses the actual market price (open for open phase,
+        close for close phase) — this reflects real market constraints.
+        """
         _, limit_down = self._limit_prices(date_idx)
-        prices = self.open_prices[date_idx] if self.phase == "open" \
-            else self.close_prices[date_idx]
-        valid_price = ~np.isnan(prices)
-        hit_limit_down = np.nan_to_num(prices, nan=-np.inf) <= limit_down
+        if self.phase == "open":
+            market_prices = self.open_prices[date_idx]
+        else:
+            market_prices = self.close_prices[date_idx]
+        valid_price = ~np.isnan(market_prices)
+        hit_limit_down = np.nan_to_num(market_prices, nan=-np.inf) <= limit_down
         mask = ~self.suspended[date_idx] & ~hit_limit_down & valid_price
         return mask
 
@@ -183,16 +232,13 @@ class AShareTradingEnv:
             (next_state, reward, done, info)
         """
         date_idx = self.current_idx
-        nav_before = self._compute_nav()
+        nav_before = self._compute_nav(self.get_valuation_prices())
 
         is_last_day = self.episode_day >= self.episode_len - 1
         if force_liquidate or (is_last_day and self.phase == "close"):
             target_weights = np.zeros(self.n_stocks)
 
-        if self.phase == "open":
-            prices = self.open_prices[date_idx]
-        else:
-            prices = self.close_prices[date_idx]
+        prices = self.get_execution_prices()
 
         can_buy = self._can_buy(date_idx)
         can_sell = self._can_sell(date_idx)
@@ -240,6 +286,8 @@ class AShareTradingEnv:
                 cost = shares * prices[i]
                 comm = max(cost * self.commission, self.min_commission)
                 total = cost + comm
+                if total > self.cash:
+                    continue
             self.cash -= total
             self.locked[i] += shares
 
@@ -252,22 +300,20 @@ class AShareTradingEnv:
         turnover = (np.abs(target_weights - self.prev_weights)).sum()
 
         if self.phase == "open":
+            # per_stock_returns: open[T] / close[T-1] - 1 (overnight gap)
+            future_prices = self.open_prices[date_idx]
+            per_stock_returns = np.where(
+                ~np.isnan(prices) & ~np.isnan(future_prices) & (prices > 0),
+                future_prices / prices - 1.0, 0.0).astype(np.float32)
+            nav_after = self._compute_nav(self.open_prices[date_idx])
+            self.phase = "close"
+        else:
+            # per_stock_returns: close[T] / open[T] - 1 (intraday)
             future_prices = self.close_prices[date_idx]
             per_stock_returns = np.where(
                 ~np.isnan(prices) & ~np.isnan(future_prices) & (prices > 0),
                 future_prices / prices - 1.0, 0.0).astype(np.float32)
-            nav_after = self._compute_nav()
-            self.phase = "close"
-        else:
-            next_idx = date_idx + 1
-            if next_idx < len(self.dates):
-                future_prices = self.open_prices[next_idx]
-                per_stock_returns = np.where(
-                    ~np.isnan(prices) & ~np.isnan(future_prices) & (prices > 0),
-                    future_prices / prices - 1.0, 0.0).astype(np.float32)
-            else:
-                per_stock_returns = np.zeros(self.n_stocks, dtype=np.float32)
-            nav_after = self._compute_nav()
+            nav_after = self._compute_nav(self.close_prices[date_idx])
             self.current_idx += 1
             self.phase = "open"
             self.holdings += self.locked
