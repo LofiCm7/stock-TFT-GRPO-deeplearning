@@ -129,7 +129,15 @@ def run_one_episode(encoder, policy, env, obs_cache, device, start_idx, bins):
         info = None
         for _phase in ["open", "close"]:
             dyn_t, stat_t, mask_t = obs_cache.get_obs(date_idx, env, device)
-            port_state = build_port_state(env, device)
+            # close phase gets T-day open return as extra signal
+            open_price_ret = None
+            if env.phase == "close" and date_idx > 0:
+                prev_close = env.close_prices[date_idx - 1]
+                cur_open = env.open_prices[date_idx]
+                open_price_ret = np.where(
+                    ~np.isnan(cur_open) & ~np.isnan(prev_close) & (prev_close > 0),
+                    cur_open / prev_close - 1.0, 0.0).astype(np.float32)
+            port_state = build_port_state(env, device, open_price_ret)
             enc_bs = getattr(config, 'ENCODER_BATCH_SIZE', 0)
             n_stocks = dyn_t.shape[0]
             if enc_bs > 0 and n_stocks > enc_bs:

@@ -13,6 +13,7 @@ MONEYFLOW_DIR = os.path.join(DATA_ROOT, "moneyflow")
 ST_DIR = os.path.join(DATA_ROOT, "stock_st")
 BASIC_CSV = os.path.join(DATA_ROOT, "basic.csv")
 MARKET_DIR = os.path.join(DATA_ROOT, "market")
+DAILY_OPEN_DIR = os.path.join(DATA_ROOT, "daily_open")
 INDEX_WEIGHT_DIR = os.path.join(DATA_ROOT, "index_weight")
 
 # ====== 股票池选择 ======
@@ -48,8 +49,8 @@ TRAIN_START = "20210701"
 TRAIN_END = "20240701"
 VAL_START = "20240702"
 VAL_END = "20250430"
-TEST_START = "20250501"
-TEST_END = "20260501"
+TEST_START = "20210701"
+TEST_END = "20260529"
 
 SEQ_LEN = 30
 PRED_HORIZON = 1
@@ -63,6 +64,8 @@ BATCH_SIZE = 2048
 PATIENCE = 25
 
 N_HOLD = 30
+K_GRAD = 60
+K_GRAD_MARGIN_WEIGHT = 0.3
 K_SWAP = 3
 INIT_CAPITAL = 1_000_000
 
@@ -80,7 +83,7 @@ GFPO_KEEP_RATIO = 0.5    # 借鉴#3 (GFPO, 2508.09726)：每个 update 采 G 条
                          # 按过滤指标只保留 top-(ratio*G) 条算梯度，其余优势置零。
                          # 用筛选做隐式 reward shaping、降低梯度方差。
                          # =1.0 时完全退回过滤前行为（n_kept==G）。
-GFPO_TURNOVER_KAPPA = 0.0  # 借鉴#4 (GFPO token-efficiency 的避坑版)：过滤指标为
+GFPO_TURNOVER_KAPPA = 0.08  # 借鉴#4 (GFPO token-efficiency 的避坑版)：过滤指标为
                          # filter_score = total_return - KAPPA * total_turnover。
                          # 用【减法】而非 reward/turnover 比值，避免除零（不交易轨迹
                          # turnover≈0 比值爆炸）与符号反转（亏损轨迹下比值排序反向）。
@@ -101,13 +104,13 @@ STAR_LOT = 200  # 科创板（688xxx）最小交易单位
 RL_STEPS = 3000
 LR_POLICY = 3e-4
 LR_ENCODER = 1e-4
-N_EXTRA_STATE = 6
+N_EXTRA_STATE = 7
 
 # ====== Episode & Competition Constraints ======
 EPISODE_LEN = 10
 MAX_CASH = 150_000
 LAMBDA_CASH_PENALTY = 0.01
-ENCODER_BATCH_SIZE = 500
+ENCODER_BATCH_SIZE = 0
 
 # ====== 改进方案超参 ======
 WARMUP_EPOCHS = 5
@@ -124,7 +127,7 @@ DIAG_SMOKE_TEST = False  # True 时用合成奖励测试 RL 管线（需手动�
 # 每隔 EVAL_INTERVAL 个 RL step，在一组固定的 held-out(VAL) 窗口上以贪心
 # (argmax) 方式跑策略，得到跨步可比的学习曲线，并据此(alpha)选最优模型。
 EVAL_INTERVAL = 30       # 每多少个 RL step 评估一次；设 0 关闭
-EVAL_MAX_WINDOWS = 25    # 评估用的固定窗口数（非重叠、均匀采样自 VAL 区间）
+EVAL_MAX_WINDOWS = 40    # 评估用的固定窗口数（非重叠、均匀采样自 VAL 区间）
 
 # ====== Diffusion Denoiser 超参 ======
 USE_DIFFUSION_DENOISER = True

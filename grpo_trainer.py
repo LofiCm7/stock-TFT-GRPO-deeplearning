@@ -161,7 +161,17 @@ class GRPOTrainer:
                         mask_cache[cache_key] = mask_t
 
                     # port_state 依赖持仓，必须逐轨迹计算（policy 是廉价 MLP）。
-                    port_state = build_port_state(env_g, device)
+                    # close phase 额外传入 T 日开盘价收益率作为第 7 维。
+                    open_price_ret = None
+                    if phase == "close":
+                        prev_close = env_g.close_prices[date_idx - 1] if date_idx > 0 else None
+                        cur_open = env_g.open_prices[date_idx]
+                        if prev_close is not None:
+                            opr = np.where(
+                                ~np.isnan(cur_open) & ~np.isnan(prev_close) & (prev_close > 0),
+                                cur_open / prev_close - 1.0, 0.0).astype(np.float32)
+                            open_price_ret = opr
+                    port_state = build_port_state(env_g, device, open_price_ret)
                     with torch.amp.autocast('cuda', enabled=self.use_amp):
                         cur_dist = self.policy(enc, port_state, mask_t, phase)
                     action = cur_dist.sample()
@@ -216,23 +226,25 @@ class GRPOTrainer:
                     if w_sum > 0:
                         target_w = target_w / w_sum
 
-                    # #4: 保留每只持仓股的 log_prob（不再 .mean()），
-                    # 用于 per-stock 截面优势的逐股梯度分配。
-                    hold_idx_t = torch.as_tensor(
-                        np.asarray(top_k_idx), device=device, dtype=torch.long)
-                    lp_per_stock = lp_all[hold_idx_t]  # [N_HOLD]
+                    # Gradient coverage: collect logp/returns for top-K_GRAD
+                    # stocks (not just N_HOLD) so "near-miss" stocks get signal.
+                    k_grad = getattr(config, 'K_GRAD', config.N_HOLD)
+                    grad_idx = np.argsort(weights)[-k_grad:]
+                    grad_idx_t = torch.as_tensor(
+                        np.asarray(grad_idx), device=device, dtype=torch.long)
+                    lp_per_stock = lp_all[grad_idx_t]  # [K_GRAD]
                     step_logps.append(lp_per_stock)
 
                     _, reward, done, info = env_g.step(target_w)
-                    # #4: 收集 per-stock 实现收益（用于截面优势）
+                    # Collect per-stock returns for K_GRAD stocks (not just N_HOLD)
                     per_stock_ret = info.get('per_stock_returns',
                                             np.zeros(env_g.n_stocks))
-                    held_returns = per_stock_ret[top_k_idx]  # [N_HOLD]
+                    held_returns = per_stock_ret[grad_idx]  # [K_GRAD]
                     # 借鉴#4: 累加换手用于 GFPO 过滤指标（仅排序，不进梯度/奖励）
                     total_turnover += float(info.get('turnover', 0.0))
                     if config.DIAG_SMOKE_TEST:
                         reward = float(np.dot(target_w, self._synth_alpha))
-                        held_returns = self._synth_alpha[top_k_idx]
+                        held_returns = self._synth_alpha[grad_idx]
                     step_stock_returns.append(held_returns)
                     step_rewards.append(reward)
                     total_reward += reward
@@ -256,13 +268,15 @@ class GRPOTrainer:
 
         # #4: per-stock 截面优势 + return-to-go 时间优势叠加。
         # 解决原 #3 的核心缺陷：同一步所有持仓股共享标量优势，无法区分个股贡献。
+        # K_GRAD > N_HOLD: 让 "差点入选" 的股票也获得梯度信号。
         gamma = config.GRPO_GAMMA
         T = min(len(sr) for sr in trajectory_step_rewards)
-        N_HOLD_actual = config.N_HOLD
+        k_grad = getattr(config, 'K_GRAD', config.N_HOLD)
+        margin_weight = getattr(config, 'K_GRAD_MARGIN_WEIGHT', 0.3)
         if T == 0:
             policy_loss = torch.tensor(0.0, device=device)
-            advantages = torch.zeros(self.G, 1, N_HOLD_actual, device=device)
-            n_kept = self.G  # 借鉴#3：空轨迹无可过滤，占位以供诊断打印
+            advantages = torch.zeros(self.G, 1, k_grad, device=device)
+            n_kept = self.G
         else:
             # --- A_temporal: [G, T] return-to-go 跨 G 轨迹 z-score ---
             returns_mat = torch.zeros(self.G, T, device=device,
@@ -279,11 +293,11 @@ class GRPOTrainer:
             A_temporal = (returns_mat - mean_g) / (std_g + 1e-8)
             A_temporal = torch.where(std_g < 1e-6,
                                      torch.zeros_like(A_temporal), A_temporal)
-            # 扩展到 [G, T, N_HOLD]（每只持仓股共享时间维度优势）
-            A_temporal = A_temporal.unsqueeze(-1).expand(-1, -1, N_HOLD_actual)
+            # 扩展到 [G, T, K_GRAD]
+            A_temporal = A_temporal.unsqueeze(-1).expand(-1, -1, k_grad)
 
-            # --- A_cross: [G, T, N_HOLD] 截面优势，跨持仓股 z-score ---
-            stock_ret_mat = torch.zeros(self.G, T, N_HOLD_actual,
+            # --- A_cross: [G, T, K_GRAD] 截面优势，跨候选股 z-score ---
+            stock_ret_mat = torch.zeros(self.G, T, k_grad,
                                         device=device, dtype=torch.float32)
             for g in range(self.G):
                 for t in range(T):
@@ -301,17 +315,19 @@ class GRPOTrainer:
             alpha = config.ALPHA_TEMPORAL
             advantages = alpha * A_temporal + (1 - alpha) * A_cross
 
-            # logp_mat: [G, T, N_HOLD]（每只股票独立的 log_prob）
+            # Margin weight: rank 1..N_HOLD 权重=1.0，rank N_HOLD+1..K_GRAD 权重=margin_weight
+            if k_grad > config.N_HOLD:
+                grad_weights = torch.ones(k_grad, device=device)
+                grad_weights[:k_grad - config.N_HOLD] = margin_weight
+                advantages = advantages * grad_weights.view(1, 1, k_grad)
+
+            # logp_mat: [G, T, K_GRAD]（每只股票独立的 log_prob）
             logp_mat = torch.stack(
                 [torch.stack(trajectory_step_logps[g][:T])
                  for g in range(self.G)])
 
             # 借鉴#3 (GFPO, 2508.09726)：采 G 条，只对按过滤指标排序的 top-k 条
             # 算梯度，其余轨迹优势置零（隐式 reward shaping + 降梯度方差）。
-            # 借鉴#4 避坑：过滤指标用【减法】 total_return - KAPPA*total_turnover，
-            # 而非 reward/turnover 比值——避免除零（不交易轨迹 turnover≈0）与
-            # 符号反转（亏损轨迹下比值排序反向）。KAPPA=0 时退化为纯收益排序。
-            # keep_ratio=1.0 时 n_kept==G，完全退回过滤前行为。
             keep_ratio = getattr(config, 'GFPO_KEEP_RATIO', 1.0)
             kappa = getattr(config, 'GFPO_TURNOVER_KAPPA', 0.0)
             n_kept = max(1, int(round(keep_ratio * self.G)))
@@ -328,8 +344,7 @@ class GRPOTrainer:
                                         dtype=advantages.dtype)
                 traj_mask[topk_idx] = 1.0
                 advantages = advantages * traj_mask.view(self.G, 1, 1)
-            # 仅在保留的 n_kept 条轨迹上归一化，避免被置零轨迹稀释梯度尺度。
-            denom = n_kept * T * N_HOLD_actual
+            denom = n_kept * T * k_grad
             policy_loss = -(advantages.detach() * logp_mat).sum() / denom
 
         loss = policy_loss + self.beta * kl_avg

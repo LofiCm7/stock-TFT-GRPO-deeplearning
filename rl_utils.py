@@ -51,17 +51,12 @@ class ObsCache:
     def get_obs(self, date_idx, env, device):
         seq_len = self.seq_len
 
-        # phase-aware observation window (anti look-ahead):
-        #   open  -> decision at T's OPEN: may only use info up to T-1 close,
-        #            so the window must END at T-1 (T's row is unknown yet).
-        #   close -> decision at T's CLOSE: T's row is already realized and we
-        #            also execute at T close, so ending at T is legitimate.
-        end = date_idx if env.phase == "close" else date_idx - 1
+        # Both phases use the same observation window ending at T-1.
+        # close phase gets T-day open price as an extra signal via port_state.
+        end = date_idx - 1
         start = end - seq_len + 1
 
         if start < 0:
-            # insufficient history (only at the very earliest dates; all three
-            # callers guard date_idx >= SEQ_LEN so this is defensive).
             normalized = np.zeros(
                 (self.n_stocks, seq_len, self.n_feat), dtype=np.float32)
             valid = np.zeros(self.n_stocks, dtype=bool)
@@ -87,8 +82,12 @@ class ObsCache:
         return dyn_t, stat_t, mask_t
 
 
-def build_port_state(env, device):
-    """Build portfolio state tensor [N_stocks, 6]."""
+def build_port_state(env, device, open_price_ret=None):
+    """Build portfolio state tensor [N_stocks, 7].
+
+    Dimensions: cash_frac, hold_frac, lock_frac, prev_w, ep_progress,
+                is_last, open_price_ret (T-day open return, 0 for open phase).
+    """
     prices = env.get_valuation_prices()
     nav = env._compute_nav(prices)
     n = env.n_stocks
@@ -105,8 +104,11 @@ def build_port_state(env, device):
     ep_progress = np.full(n, ep_day / max(ep_len, 1), dtype=np.float32)
     is_last = np.full(n, float(ep_day >= ep_len - 1), dtype=np.float32)
 
+    if open_price_ret is None:
+        open_price_ret = np.zeros(n, dtype=np.float32)
+
     state = np.stack([cash_frac, hold_frac, lock_frac, prev_w,
-                      ep_progress, is_last], axis=-1)
+                      ep_progress, is_last, open_price_ret], axis=-1)
     return torch.tensor(state, device=device)
 
 
