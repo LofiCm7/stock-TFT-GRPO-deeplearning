@@ -16,7 +16,9 @@ from rl_utils import build_port_state, ObsCache
 
 
 def load_rl_model(device, avail_features):
-    ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
+    ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy_v2.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
     if not os.path.exists(ckpt_path):
         print("No RL model found. Run train_rl.py first.")
         return None, None
@@ -149,9 +151,7 @@ def run_one_episode(encoder, policy, env, obs_cache, device, start_idx, bins):
             else:
                 enc = encoder(dyn_t, stat_t)
             dist = policy(enc, port_state, mask_t, env.phase)
-            action = dist.probs.argmax(dim=-1)
-
-            weights = bins[action].cpu().numpy()
+            weights = (dist.probs * bins).sum(dim=-1).cpu().numpy()
             top_k_idx = np.argsort(weights)[-config.N_HOLD:]
             target_w = np.zeros(env.n_stocks)
             for idx in top_k_idx:

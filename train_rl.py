@@ -218,9 +218,7 @@ def main():
     eval_history = []  # (step, excess_mean, mean_ret, episode_ir, win_rate)
     t_start = time.time()
 
-    # 用启动时间戳生成本次训练的唯一文件名，避免覆盖上一次的最佳模型
-    run_tag = time.strftime("%Y%m%d_%H%M%S", time.localtime(t_start))
-    best_model_name = f"best_rl_policy_{run_tag}.pt"
+    best_model_name = "best_rl_policy_v2.pt"
 
     def save_best(step):
         save_path = os.path.join(config.CACHE_DIR, best_model_name)

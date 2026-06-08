@@ -57,7 +57,7 @@ PRED_HORIZON = 1
 
 HIDDEN_DIM = 128
 NUM_HEADS = 4
-DROPOUT = 0.35
+DROPOUT = 0.15
 LR = 5e-4
 EPOCHS = 150
 BATCH_SIZE = 2048
@@ -70,8 +70,8 @@ K_SWAP = 3
 INIT_CAPITAL = 1_000_000
 
 # ====== RL (GRPO) 超参 ======
-N_BINS = 6
-BINS = [0.0, 0.025, 0.05, 0.10, 0.15, 0.20]
+N_BINS = 11
+BINS = [0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20]
 GRPO_G = 16
 GRPO_BETA = 0.04
 GRPO_REF_REFRESH = 150
@@ -103,7 +103,7 @@ LOT = 100
 STAR_LOT = 200  # 科创板（688xxx）最小交易单位
 RL_STEPS = 3000
 LR_POLICY = 3e-4
-LR_ENCODER = 1e-4
+LR_ENCODER = 3e-4
 N_EXTRA_STATE = 7
 
 # ====== Episode & Competition Constraints ======
@@ -115,7 +115,7 @@ ENCODER_BATCH_SIZE = 0
 # ====== 改进方案超参 ======
 WARMUP_EPOCHS = 5
 WARMUP_LR = 1e-3
-LAMBDA_AUX = 0.05
+LAMBDA_AUX = 0.3
 LAMBDA_BENCHMARK = 0.5
 ALPHA_TEMPORAL = 0.3   # 时间维度优势的混合权重（截面优势权重 = 1 - ALPHA_TEMPORAL）
 
