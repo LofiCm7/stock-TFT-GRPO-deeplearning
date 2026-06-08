@@ -269,7 +269,31 @@ def main():
         action = dist.probs.argmax(dim=-1)
 
     weights = bins[action].cpu().numpy()
-    top_k_idx = np.argsort(weights)[-config.N_HOLD:]
+
+    # --- Generate orders ---
+    exec_prices = env.get_execution_prices()
+    nav = env._compute_nav(env.get_valuation_prices())
+    sellable_holdings = env.holdings.copy()
+    current_holdings = env.holdings + env.locked
+    from env import _round_to_lot
+
+    # Select top_k, skipping stocks that can't buy 1 lot and aren't held
+    sorted_idx = np.argsort(weights)[::-1]
+    top_k_idx = []
+    for idx in sorted_idx:
+        if len(top_k_idx) >= config.N_HOLD:
+            break
+        if weights[idx] <= 0:
+            break
+        ref_p = exec_prices[idx]
+        if np.isnan(ref_p) or ref_p <= 0:
+            continue
+        # Estimate: assume equal weight 1/N_HOLD for affordability check
+        est = _round_to_lot(nav / config.N_HOLD / ref_p, env.lots[idx])
+        if est == 0 and current_holdings[idx] == 0:
+            continue
+        top_k_idx.append(idx)
+    top_k_idx = np.array(top_k_idx, dtype=np.int64)
 
     target_w = np.zeros(env.n_stocks)
     for idx in top_k_idx:
@@ -278,11 +302,6 @@ def main():
     if w_sum > 0:
         target_w /= w_sum
 
-    # --- Generate orders ---
-    exec_prices = env.get_execution_prices()
-    nav = env._compute_nav(env.get_valuation_prices())
-    sellable_holdings = env.holdings.copy()
-    current_holdings = env.holdings + env.locked
     orders = []
 
     # Stocks to buy/hold
@@ -292,7 +311,6 @@ def main():
         ref_price = exec_prices[i]
         if np.isnan(ref_price) or ref_price <= 0:
             continue
-        from env import _round_to_lot
         est_shares = _round_to_lot(
             target_w[i] * nav / ref_price, env.lots[i])
         current_held = int(current_holdings[i])
