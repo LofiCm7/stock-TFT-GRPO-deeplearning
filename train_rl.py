@@ -213,7 +213,7 @@ def main():
     print(f"RL training for {config.RL_STEPS} episodes "
           f"({len(valid_starts)} valid starts)...")
     print("Training encoder + policy end-to-end with GRPO from scratch.")
-    best_alpha = -np.inf
+    best_ret = -np.inf
     reward_history = []
     eval_history = []  # (step, excess_mean, mean_ret, episode_ir, win_rate)
     t_start = time.time()
@@ -262,27 +262,28 @@ def main():
                   f"kl={metrics['kl']:.4f} | "
                   f"{speed:.2f} ep/s | ETA {eta/60:.1f}min")
 
-        # 固定窗口贪心评估：跨步可比的学习曲线，并据 alpha(excess_mean) 选最优
+        # 固定窗口贪心评估：跨步可比的学习曲线，并据 mean_ret(绝对收益) 选最优
         if (config.EVAL_INTERVAL > 0 and eval_starts and
                 step % config.EVAL_INTERVAL == 0):
             em = evaluate_greedy(encoder, policy, env, obs_cache, device,
                                  eval_starts, eval_close_map)
             if em is not None:
                 alpha = em['excess_mean']
-                eval_history.append((step, alpha, em['mean_ret'],
+                mean_ret = em['mean_ret']
+                eval_history.append((step, alpha, mean_ret,
                                      em['episode_ir'], em['win_rate']))
                 tag = ""
-                if alpha > best_alpha:
-                    best_alpha = alpha
+                if mean_ret > best_ret:
+                    best_ret = mean_ret
                     save_best(step)
                     tag = "  <- best"
-                print(f"  [EVAL step {step}] alpha(excess)={alpha*100:+.3f}%  "
-                      f"ret={em['mean_ret']*100:+.3f}%  "
+                print(f"  [EVAL step {step}] ret={mean_ret*100:+.3f}%  "
+                      f"alpha(excess)={alpha*100:+.3f}%  "
                       f"IR={em['episode_ir']:.3f}  "
                       f"beat={em['beat_bench_rate']*100:.0f}%  "
                       f"win={em['win_rate']*100:.0f}%{tag}")
 
-    print(f"Training done. Best greedy-eval alpha: {best_alpha*100:+.3f}%")
+    print(f"Training done. Best greedy-eval ret: {best_ret*100:+.3f}%")
     total_time = time.time() - t_start
     print(f"Total training time: {total_time/60:.1f} min "
           f"({total_time/config.RL_STEPS:.2f} s/episode)")
