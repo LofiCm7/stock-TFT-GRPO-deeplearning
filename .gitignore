@@ -1,1 +1,5 @@
 __pycache__/**
+diagnose_collapse.py
+diagnose_grpo.py
+diagnose_rl.py
+diagnose_across.py

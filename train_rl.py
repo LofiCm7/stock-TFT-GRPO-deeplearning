@@ -20,7 +20,7 @@ from greedy_eval import build_eval_windows, evaluate_greedy
 from backtest_rl import load_benchmark_close_map
 
 
-SEED = 42
+SEED = 37
 
 
 def set_seed(seed=SEED):
@@ -218,8 +218,10 @@ def main():
     eval_history = []  # (step, excess_mean, mean_ret, episode_ir, win_rate)
     t_start = time.time()
 
+    best_model_name = "best_rl_policy_v2.pt"
+
     def save_best(step):
-        save_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
+        save_path = os.path.join(config.CACHE_DIR, best_model_name)
         os.makedirs(config.CACHE_DIR, exist_ok=True)
         torch.save({
             "encoder": encoder.state_dict(),
@@ -287,7 +289,7 @@ def main():
     total_time = time.time() - t_start
     print(f"Total training time: {total_time/60:.1f} min "
           f"({total_time/config.RL_STEPS:.2f} s/episode)")
-    print(f"Model saved to {os.path.join(config.CACHE_DIR, 'best_rl_policy.pt')}")
+    print(f"Model saved to {os.path.join(config.CACHE_DIR, best_model_name)}")
     plot_rl_reward_curve(reward_history)
     plot_greedy_eval_curve(eval_history)
 

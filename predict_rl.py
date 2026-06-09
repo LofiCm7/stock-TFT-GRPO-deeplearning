@@ -94,9 +94,11 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
+    ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy_v2.pt")
     if not os.path.exists(ckpt_path):
-        print(f"No RL model found at {ckpt_path}. Run train_rl.py first.")
+        ckpt_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
+    if not os.path.exists(ckpt_path):
+        print(f"No RL model found. Run train_rl.py first.")
         return
 
     # --- Build dataset (up to T-1 for features) ---
@@ -266,9 +268,7 @@ def main():
         else:
             enc = encoder(dyn_t, stat_t)
         dist = policy(enc, port_state, mask_t, args.phase)
-        action = dist.probs.argmax(dim=-1)
-
-    weights = bins[action].cpu().numpy()
+        weights = (dist.probs * bins).sum(dim=-1).cpu().numpy()
 
     # --- Generate orders ---
     exec_prices = env.get_execution_prices()
