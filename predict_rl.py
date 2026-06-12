@@ -26,17 +26,23 @@ def get_next_trade_date(last_date):
 def load_portfolio(path, env):
     port_df = pd.read_csv(path, dtype={"ts_code": str})
     holdings = np.zeros(env.n_stocks, dtype=np.int64)
+    locked = np.zeros(env.n_stocks, dtype=np.int64)
+    has_locked = "locked" in port_df.columns
     unknown = []
     for _, row in port_df.iterrows():
         code = row["ts_code"]
         shares = int(row["shares"])
         if code in env.code_to_idx:
-            holdings[env.code_to_idx[code]] = shares
+            idx = env.code_to_idx[code]
+            if has_locked and int(row["locked"]) == 1:
+                locked[idx] = shares
+            else:
+                holdings[idx] = shares
         else:
             unknown.append(code)
     if unknown:
         print(f"WARNING: {len(unknown)} codes not in universe: {unknown[:5]}")
-    return holdings
+    return holdings, locked
 
 
 def inject_placeholder_row(df, last_real_date, target_date):
@@ -90,6 +96,9 @@ def main():
                         help="Current cash (default: INIT_CAPITAL if no portfolio)")
     parser.add_argument("--episode-day", type=int, default=0,
                         help="Current day within the episode (0-9)")
+    parser.add_argument("--no-liquidate", action="store_true",
+                        help="Disable forced liquidation on last episode day "
+                             "(use for live trading)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -209,18 +218,21 @@ def main():
 
     # Inject real portfolio if provided
     if args.portfolio:
-        holdings = load_portfolio(args.portfolio, env)
+        holdings, locked = load_portfolio(args.portfolio, env)
         env.holdings = holdings
+        env.locked = locked
         if args.cash is not None:
             env.cash = args.cash
         else:
             val_prices = env.get_valuation_prices()
-            stock_val = np.nansum(holdings.astype(np.float64) * val_prices)
+            all_shares = (holdings + locked).astype(np.float64)
+            stock_val = np.nansum(all_shares * val_prices)
             env.cash = max(0, config.INIT_CAPITAL - stock_val)
         val_prices = env.get_valuation_prices()
         nav = env._compute_nav(val_prices)
         if nav > 0:
-            hold_val = holdings.astype(np.float64) * np.nan_to_num(val_prices, 0)
+            all_shares = (holdings + locked).astype(np.float64)
+            hold_val = all_shares * np.nan_to_num(val_prices, 0)
             env.prev_weights = (hold_val / nav).astype(np.float64)
     elif args.cash is not None:
         env.cash = args.cash
@@ -229,8 +241,8 @@ def main():
     bins = torch.tensor(config.BINS, device=device, dtype=torch.float32)
     is_last_day = args.episode_day >= config.EPISODE_LEN - 1
 
-    # Force liquidate on last day close phase
-    if is_last_day and args.phase == "close":
+    # Force liquidate on last day close phase (disabled with --no-liquidate)
+    if is_last_day and args.phase == "close" and not args.no_liquidate:
         orders = []
         prices_now = env.get_execution_prices()
         for i in range(env.n_stocks):
@@ -277,20 +289,41 @@ def main():
     current_holdings = env.holdings + env.locked
     from env import _round_to_lot
 
-    # Select top_k, skipping stocks that can't buy 1 lot and aren't held
+    # Compute available capital for rebalancing:
+    # = cash + value of sellable holdings (what we can actually liquidate)
+    sellable_value = np.nansum(
+        sellable_holdings.astype(np.float64) * np.nan_to_num(exec_prices, 0)
+    ) * (1 - config.COMMISSION - config.STAMP)
+    available_capital = env.cash + sellable_value
+
+    # Select top_k stocks for target portfolio.
+    # Locked holdings that cannot be sold MUST occupy slots in N_HOLD.
     sorted_idx = np.argsort(weights)[::-1]
+
+    # First: locked-only holdings (sellable=0) forcibly occupy slots
+    forced_hold_idx = set()
+    for i in range(env.n_stocks):
+        if current_holdings[i] > 0 and sellable_holdings[i] == 0:
+            forced_hold_idx.add(i)
+    n_free_slots = max(0, config.N_HOLD - len(forced_hold_idx))
+
     top_k_idx = []
     for idx in sorted_idx:
-        if len(top_k_idx) >= config.N_HOLD:
+        if len(top_k_idx) >= n_free_slots:
             break
         if weights[idx] <= 0:
             break
+        if idx in forced_hold_idx:
+            continue
         ref_p = exec_prices[idx]
         if np.isnan(ref_p) or ref_p <= 0:
             continue
-        # Estimate: assume equal weight 1/N_HOLD for affordability check
-        est = _round_to_lot(nav / config.N_HOLD / ref_p, env.lots[idx])
-        if est == 0 and current_holdings[idx] == 0:
+        if current_holdings[idx] > 0:
+            top_k_idx.append(idx)
+            continue
+        est = _round_to_lot(available_capital / max(n_free_slots, 1) / ref_p,
+                            env.lots[idx])
+        if est == 0:
             continue
         top_k_idx.append(idx)
     top_k_idx = np.array(top_k_idx, dtype=np.int64)
@@ -311,16 +344,22 @@ def main():
         ref_price = exec_prices[i]
         if np.isnan(ref_price) or ref_price <= 0:
             continue
-        est_shares = _round_to_lot(
-            target_w[i] * nav / ref_price, env.lots[i])
         current_held = int(current_holdings[i])
         sellable = int(sellable_holdings[i])
+        est_shares = _round_to_lot(
+            target_w[i] * available_capital / ref_price, env.lots[i])
+        # Cannot exceed current held + what we can afford to buy
+        est_shares = max(est_shares, int(env.locked[i]))
         delta = est_shares - current_held
         if delta > 0:
             side = "buy"
         elif delta < 0:
-            side = "sell"
             delta = min(-delta, sellable)
+            if delta > 0:
+                side = "sell"
+            else:
+                side = "hold"
+                est_shares = current_held
         else:
             side = "hold"
             delta = 0
@@ -341,16 +380,47 @@ def main():
         sellable = int(sellable_holdings[i])
         if held > 0 and target_w[i] <= 0:
             ref_price = exec_prices[i]
-            orders.append({
-                "date": target_date, "phase": args.phase,
-                "code": env.codes[i], "side": "sell",
-                "target_weight": 0.0,
-                "est_shares": 0,
-                "delta_shares": sellable,
-                "ref_price": round(float(ref_price), 3),
-                "current_held": held,
-                "sellable": sellable,
-            })
+            if sellable == 0:
+                orders.append({
+                    "date": target_date, "phase": args.phase,
+                    "code": env.codes[i], "side": "hold",
+                    "target_weight": 0.0,
+                    "est_shares": held,
+                    "delta_shares": 0,
+                    "ref_price": round(float(ref_price), 3),
+                    "current_held": held,
+                    "sellable": 0,
+                })
+            else:
+                orders.append({
+                    "date": target_date, "phase": args.phase,
+                    "code": env.codes[i], "side": "sell",
+                    "target_weight": 0.0,
+                    "est_shares": 0,
+                    "delta_shares": sellable,
+                    "ref_price": round(float(ref_price), 3),
+                    "current_held": held,
+                    "sellable": sellable,
+                })
+
+    # Post-process: cap total buy cost to available cash
+    buy_orders = [o for o in orders if o["side"] == "buy"]
+    sell_proceeds = sum(
+        o["delta_shares"] * o["ref_price"] * (1 - config.COMMISSION - config.STAMP)
+        for o in orders if o["side"] == "sell")
+    budget = env.cash + sell_proceeds
+    total_buy_cost = sum(
+        o["delta_shares"] * o["ref_price"] * (1 + config.COMMISSION)
+        for o in buy_orders)
+    if total_buy_cost > budget and total_buy_cost > 0:
+        scale = budget / total_buy_cost
+        for o in buy_orders:
+            if o["delta_shares"] > 0:
+                si = env.code_to_idx[o["code"]]
+                scaled = _round_to_lot(
+                    o["delta_shares"] * scale, env.lots[si])
+                o["delta_shares"] = scaled
+                o["est_shares"] = int(current_holdings[si]) + scaled
 
     _output_results(orders, args, env, target_date)
 
@@ -400,7 +470,28 @@ def _output_results(orders, args, env, target_date):
     for _, row in result_df.iterrows():
         est = int(row.get("est_shares", 0))
         if est > 0:
-            next_holdings.append({"ts_code": row["code"], "shares": est})
+            code = row["code"]
+            if args.phase == "open":
+                si = env.code_to_idx[code]
+                cur_locked = int(env.locked[si])
+                delta = int(row.get("delta_shares", 0))
+                if row["side"] == "buy":
+                    locked_shares = cur_locked + delta
+                else:
+                    locked_shares = cur_locked
+                locked_shares = min(locked_shares, est)
+                unlocked_shares = est - locked_shares
+            else:
+                locked_shares = 0
+                unlocked_shares = est
+            if unlocked_shares > 0:
+                next_holdings.append({
+                    "ts_code": code, "shares": unlocked_shares, "locked": 0
+                })
+            if locked_shares > 0:
+                next_holdings.append({
+                    "ts_code": code, "shares": locked_shares, "locked": 1
+                })
     if next_holdings:
         next_port_df = pd.DataFrame(next_holdings)
         next_port_path = os.path.join(config.CACHE_DIR, "next_holdings.csv")
